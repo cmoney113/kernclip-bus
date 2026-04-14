@@ -30,6 +30,14 @@ var DefaultConfig = Config{
 		{Prefix: "hook.", RingSize: 512},
 		{Prefix: "context.", RingSize: 256},
 		{Prefix: "ai.", RingSize: 2048},
+		// System monitoring — small ring (latest snapshot is all that matters)
+		{Prefix: "gtt.system.metrics", RingSize: 32},
+		{Prefix: "gtt.system.top_disk_writers", RingSize: 16},
+		// ACK topics — very small, just the last result
+		{Prefix: "gtt.system.ack.", RingSize: 8},
+		// Command topics — small ring is fine
+		{Prefix: "gtt.settings.", RingSize: 16},
+		{Prefix: "gtt.system.", RingSize: 32},
 	},
 }
 

@@ -807,6 +807,16 @@ func main() {
 
 	bus := newBus()
 
+	// ── Built-in daemon services ──────────────────────────────────────────
+	// System monitor: polls /proc every 2s, publishes gtt.system.metrics
+	// and gtt.system.top_disk_writers to the bus.
+	startSystemMonitor(bus, 2*time.Second)
+
+	// Command dispatcher: subscribes to gtt.settings.* / gtt.system.*
+	// command topics and executes side effects (brightness, volume, dconf,
+	// systemctl, kill, notify-send, etc.).
+	startCommandDispatcher(bus)
+
 	log.Printf("kernclip-busd listening on %s", sockPath)
 
 	// graceful shutdown
