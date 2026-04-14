@@ -402,6 +402,115 @@ func buildManifest(bus *Bus) *Manifest {
 				Description: "Return daemon health and active topic count. Useful for diagnostics — call this first if other tools are failing.",
 				Params:      map[string]OpParam{},
 			},
+
+			// ── System monitor tools (read-only) ──────────────────────────────
+			{
+				Op:          "system_metrics",
+				ToolName:    "bus_system_metrics",
+				Description: "Get the latest system metrics snapshot: CPU %, RAM, swap, disk read/write speed, network download/upload speed, and process count. Published by the daemon every 2 seconds. Use this to check system health before taking automated actions.",
+				Params:      map[string]OpParam{},
+			},
+			{
+				Op:          "system_top_disk_writers",
+				ToolName:    "bus_system_top_disk_writers",
+				Description: "Get the top 5 processes currently writing the most data to disk (by write speed in bytes/s). Returns [{pid, name, write_speed}]. Use this to identify which process to pause or kill during high disk usage.",
+				Params:      map[string]OpParam{},
+			},
+
+			// ── Display & audio controls ───────────────────────────────────────
+			{
+				Op:          "set_brightness",
+				ToolName:    "bus_set_brightness",
+				Description: "Set the screen brightness. Value is a percentage 0–100. Uses brightnessctl if available, falls back to xrandr. The change takes effect immediately.",
+				Params: map[string]OpParam{
+					"value": {Type: "integer", Required: true, Description: "Brightness level 0–100 (percent)"},
+				},
+			},
+			{
+				Op:          "set_volume",
+				ToolName:    "bus_set_volume",
+				Description: "Set the system audio output volume. Value is a percentage 0–150 (values above 100 enable amplification). Uses wpctl (PipeWire), pactl (PulseAudio), or amixer as fallback.",
+				Params: map[string]OpParam{
+					"value": {Type: "integer", Required: true, Description: "Volume level 0–150 (percent, values >100 amplify)"},
+				},
+			},
+
+			// ── Desktop settings ──────────────────────────────────────────────
+			{
+				Op:          "set_nightlight",
+				ToolName:    "bus_set_nightlight",
+				Description: "Enable or disable GNOME Night Light (blue light filter). Changes org.gnome.settings-daemon.plugins.color night-light-enabled via gsettings.",
+				Params: map[string]OpParam{
+					"enabled": {Type: "boolean", Required: true, Description: "true to enable Night Light, false to disable"},
+				},
+			},
+			{
+				Op:          "dconf_write",
+				ToolName:    "bus_dconf_write",
+				Description: "Write a value to any dconf/GSettings key. Use this to change any GNOME or system setting that has a dconf path. Format: path and value exactly as dconf CLI expects.",
+				Params: map[string]OpParam{
+					"path":  {Type: "string", Required: true, Description: "dconf key path, e.g. /org/gnome/desktop/interface/color-scheme"},
+					"value": {Type: "string", Required: true, Description: "dconf value, e.g. 'prefer-dark' (with single quotes for strings)"},
+				},
+			},
+			{
+				Op:          "gsettings_set",
+				ToolName:    "bus_gsettings_set",
+				Description: "Set a GSettings key via the gsettings CLI. Use this when you know the schema and key name rather than the dconf path.",
+				Params: map[string]OpParam{
+					"schema": {Type: "string", Required: true, Description: "GSettings schema, e.g. org.gnome.desktop.interface"},
+					"key":    {Type: "string", Required: true, Description: "Key name, e.g. color-scheme"},
+					"value":  {Type: "string", Required: true, Description: "New value, e.g. prefer-dark"},
+				},
+			},
+
+			// ── Process management ────────────────────────────────────────────
+			{
+				Op:          "kill_pid",
+				ToolName:    "bus_kill_pid",
+				Description: "Kill a process by its PID (sends SIGKILL). Use bus_system_top_disk_writers or bus_system_metrics to find the PID of a resource-heavy process before calling this.",
+				Params: map[string]OpParam{
+					"pid": {Type: "integer", Required: true, Description: "Process ID to kill"},
+				},
+			},
+			{
+				Op:          "kill_name",
+				ToolName:    "bus_kill_name",
+				Description: "Kill all processes matching a name (sends SIGKILL via pkill). Use carefully — this kills every process with that name.",
+				Params: map[string]OpParam{
+					"name": {Type: "string", Required: true, Description: "Process name to kill, e.g. chrome, firefox"},
+				},
+			},
+
+			// ── Service management ────────────────────────────────────────────
+			{
+				Op:          "manage_service",
+				ToolName:    "bus_manage_service",
+				Description: "Manage a systemd service. Supported actions: start, stop, restart, reload, enable, disable, mask, unmask, status. The result (including status output) is returned.",
+				Params: map[string]OpParam{
+					"action":  {Type: "string", Required: true, Description: "One of: start, stop, restart, reload, enable, disable, mask, unmask, status"},
+					"service": {Type: "string", Required: true, Description: "Service name, e.g. nginx, bluetooth, sshd"},
+				},
+			},
+
+			// ── Notifications & shell ─────────────────────────────────────────
+			{
+				Op:          "desktop_notify",
+				ToolName:    "bus_desktop_notify",
+				Description: "Send a desktop notification to the user via notify-send. Use this to alert the user about automated actions you've taken (e.g. 'Killed chrome because RAM > 90%').",
+				Params: map[string]OpParam{
+					"title": {Type: "string", Required: true, Description: "Notification title"},
+					"body":  {Type: "string", Required: true, Description: "Notification body text"},
+				},
+			},
+			{
+				Op:          "shell_exec",
+				ToolName:    "bus_shell_exec",
+				Description: "Execute an arbitrary shell command on the host system and return its output. Use sparingly and only for tasks not covered by other bus tools. The command runs as the current user.",
+				Params: map[string]OpParam{
+					"command": {Type: "string", Required: true, Description: "Shell command to execute (runs via bash -c)"},
+				},
+			},
 		},
 	}
 }
@@ -684,6 +793,110 @@ func handleConn(conn net.Conn, bus *Bus) {
 				"socket":       socketPath(),
 				"version":      "1.1.0",
 			})
+
+		// ── System monitor read ops ───────────────────────────────────────────
+
+		case "system_metrics":
+			t := bus.getOrCreate("gtt.system.metrics")
+			msg, ok := t.latest()
+			if !ok {
+				enc.Encode(map[string]interface{}{"ok": true, "data": nil, "note": "no metrics yet — daemon polls every 2s"})
+			} else {
+				enc.Encode(map[string]interface{}{"ok": true, "topic": "gtt.system.metrics", "data": msg.Data, "ts": msg.Timestamp})
+			}
+
+		case "system_top_disk_writers":
+			t := bus.getOrCreate("gtt.system.top_disk_writers")
+			msg, ok := t.latest()
+			if !ok {
+				enc.Encode(map[string]interface{}{"ok": true, "data": nil, "note": "no disk writer data yet"})
+			} else {
+				enc.Encode(map[string]interface{}{"ok": true, "topic": "gtt.system.top_disk_writers", "data": msg.Data, "ts": msg.Timestamp})
+			}
+
+		// ── Command dispatch ops ──────────────────────────────────────────────
+
+		case "set_brightness":
+			val, _ := rawReq["value"].(float64)
+			data := fmt.Sprintf("%d", int(val))
+			t := bus.getOrCreate("gtt.settings.brightness")
+			m := Message{Topic: "gtt.settings.brightness", Mime: "text/plain", Data: data, Sender: sender(conn)}
+			pub := t.publish(m); bus.patterns.FanOut("gtt.settings.brightness", pub)
+			enc.Encode(map[string]interface{}{"ok": true, "op": "set_brightness", "value": data})
+
+		case "set_volume":
+			val, _ := rawReq["value"].(float64)
+			data := fmt.Sprintf("%d", int(val))
+			t := bus.getOrCreate("gtt.settings.volume")
+			m := Message{Topic: "gtt.settings.volume", Mime: "text/plain", Data: data, Sender: sender(conn)}
+			pub := t.publish(m); bus.patterns.FanOut("gtt.settings.volume", pub)
+			enc.Encode(map[string]interface{}{"ok": true, "op": "set_volume", "value": data})
+
+		case "set_nightlight":
+			enabled, _ := rawReq["enabled"].(bool)
+			data := "false"
+			if enabled { data = "true" }
+			t := bus.getOrCreate("gtt.settings.nightlight")
+			m := Message{Topic: "gtt.settings.nightlight", Mime: "text/plain", Data: data, Sender: sender(conn)}
+			pub := t.publish(m); bus.patterns.FanOut("gtt.settings.nightlight", pub)
+			enc.Encode(map[string]interface{}{"ok": true, "op": "set_nightlight", "enabled": enabled})
+
+		case "dconf_write":
+			path, _ := rawReq["path"].(string)
+			value, _ := rawReq["value"].(string)
+			t := bus.getOrCreate("gtt.settings.dconf")
+			m := Message{Topic: "gtt.settings.dconf", Mime: "text/plain", Data: path + " " + value, Sender: sender(conn)}
+			pub := t.publish(m); bus.patterns.FanOut("gtt.settings.dconf", pub)
+			enc.Encode(map[string]interface{}{"ok": true, "op": "dconf_write", "path": path, "value": value})
+
+		case "gsettings_set":
+			schema, _ := rawReq["schema"].(string)
+			key, _ := rawReq["key"].(string)
+			value, _ := rawReq["value"].(string)
+			t := bus.getOrCreate("gtt.settings.gsettings")
+			m := Message{Topic: "gtt.settings.gsettings", Mime: "text/plain", Data: schema + " " + key + " " + value, Sender: sender(conn)}
+			pub := t.publish(m); bus.patterns.FanOut("gtt.settings.gsettings", pub)
+			enc.Encode(map[string]interface{}{"ok": true, "op": "gsettings_set", "schema": schema, "key": key, "value": value})
+
+		case "kill_pid":
+			pidF, _ := rawReq["pid"].(float64)
+			data := fmt.Sprintf("%d", int(pidF))
+			t := bus.getOrCreate("gtt.system.kill")
+			m := Message{Topic: "gtt.system.kill", Mime: "text/plain", Data: data, Sender: sender(conn)}
+			pub := t.publish(m); bus.patterns.FanOut("gtt.system.kill", pub)
+			enc.Encode(map[string]interface{}{"ok": true, "op": "kill_pid", "pid": int(pidF)})
+
+		case "kill_name":
+			name, _ := rawReq["name"].(string)
+			t := bus.getOrCreate("gtt.system.killname")
+			m := Message{Topic: "gtt.system.killname", Mime: "text/plain", Data: name, Sender: sender(conn)}
+			pub := t.publish(m); bus.patterns.FanOut("gtt.system.killname", pub)
+			enc.Encode(map[string]interface{}{"ok": true, "op": "kill_name", "name": name})
+
+		case "manage_service":
+			action, _ := rawReq["action"].(string)
+			service, _ := rawReq["service"].(string)
+			t := bus.getOrCreate("gtt.system.service")
+			m := Message{Topic: "gtt.system.service", Mime: "text/plain", Data: action + ":" + service, Sender: sender(conn)}
+			pub := t.publish(m); bus.patterns.FanOut("gtt.system.service", pub)
+			enc.Encode(map[string]interface{}{"ok": true, "op": "manage_service", "action": action, "service": service})
+
+		case "desktop_notify":
+			title, _ := rawReq["title"].(string)
+			body, _ := rawReq["body"].(string)
+			t := bus.getOrCreate("gtt.system.notify")
+			m := Message{Topic: "gtt.system.notify", Mime: "text/plain", Data: title + "|" + body, Sender: sender(conn)}
+			pub := t.publish(m); bus.patterns.FanOut("gtt.system.notify", pub)
+			enc.Encode(map[string]interface{}{"ok": true, "op": "desktop_notify", "title": title, "body": body})
+
+		case "shell_exec":
+			command, _ := rawReq["command"].(string)
+			t := bus.getOrCreate("gtt.system.exec")
+			m := Message{Topic: "gtt.system.exec", Mime: "text/plain", Data: command, Sender: sender(conn)}
+			pub := t.publish(m); bus.patterns.FanOut("gtt.system.exec", pub)
+			enc.Encode(map[string]interface{}{"ok": true, "op": "shell_exec", "command": command})
+
+
 
 				default:
 			fail(fmt.Sprintf("unknown op: %q", op))
