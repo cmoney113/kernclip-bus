@@ -1,0 +1,34 @@
+# KernClip Bus Daemon Configuration
+#
+# Ring buffer sizes are per-topic. When a topic's ring fills,
+# oldest messages are dropped. Use larger sizes for high-volume
+# topics like agent thoughts.
+
+default_ring_size = 128
+
+# Topic prefix overrides - longest prefix match wins.
+# These are tuned for typical AI agent workloads.
+
+[[topic_overrides]]
+prefix    = "agent."
+ring_size = 4096
+
+[[topic_overrides]]
+prefix    = "sandbox."
+ring_size = 1024
+
+[[topic_overrides]]
+prefix    = "pattern."
+ring_size = 512
+
+[[topic_overrides]]
+prefix    = "hook."
+ring_size = 512
+
+[[topic_overrides]]
+prefix    = "context."
+ring_size = 256
+
+[[topic_overrides]]
+prefix    = "ai."
+ring_size = 2048
