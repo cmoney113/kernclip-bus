@@ -199,10 +199,10 @@ Published automatically by `kernclip-busd` every 2 seconds — no configuration 
 
 ```bash
 # Live CPU % in your terminal:
-kc-bus sub gtt.system.metrics --data-only | jq .cpu_percent
+kb sub gtt.system.metrics --data-only | jq .cpu_percent
 
 # Watch disk writers:
-kc-bus sub gtt.system.top_disk_writers --data-only | jq .
+kb sub gtt.system.top_disk_writers --data-only | jq .
 ```
 
 ---
@@ -226,20 +226,20 @@ Publish to a command topic → the daemon executes a side effect and ACKs on `gt
 
 ```bash
 # Dim the screen to 30%:
-kc-bus pub gtt.settings.brightness 30
+kb pub gtt.settings.brightness 30
 
 # Set volume to 50% and wait for confirmation:
-kc-bus pub gtt.settings.volume 50
-kc-bus wait gtt.system.ack.settings_volume --data-only
+kb pub gtt.settings.volume 50
+kb wait gtt.system.ack.settings_volume --data-only
 
 # Restart a systemd service:
-kc-bus pub gtt.system.service "restart:nginx"
+kb pub gtt.system.service "restart:nginx"
 
 # Send a desktop notification:
-kc-bus pub gtt.system.notify "Alert|CPU is above 90%"
+kb pub gtt.system.notify "Alert|CPU is above 90%"
 
 # Write a dconf key:
-kc-bus pub gtt.settings.dconf "/org/gnome/desktop/interface/color-scheme 'prefer-dark'"
+kb pub gtt.settings.dconf "/org/gnome/desktop/interface/color-scheme 'prefer-dark'"
 ```
 
 ---
