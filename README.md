@@ -188,6 +188,62 @@ Run the full demo: `python3 examples/ai-collab/demo.py`
 
 ---
 
+## System monitor topics
+
+Published automatically by `kernclip-busd` every 2 seconds — no configuration needed.
+
+| Topic | Description |
+|---|---|
+| `gtt.system.metrics` | JSON: `cpu_percent`, `ram_used_percent`, `swap_used_percent`, `disk_read_speed`, `disk_write_speed`, `net_download_speed`, `net_upload_speed`, `process_count` |
+| `gtt.system.top_disk_writers` | JSON array of top 5 processes by write speed: `{pid, name, write_speed}` |
+
+```bash
+# Live CPU % in your terminal:
+kc-bus sub gtt.system.metrics --data-only | jq .cpu_percent
+
+# Watch disk writers:
+kc-bus sub gtt.system.top_disk_writers --data-only | jq .
+```
+
+---
+
+## Command topics
+
+Publish to a command topic → the daemon executes a side effect and ACKs on `gtt.system.ack.*`.
+
+| Publish to | Data format | Effect |
+|---|---|---|
+| `gtt.settings.brightness` | `"50"` | Set screen brightness 0–100% (brightnessctl / xrandr) |
+| `gtt.settings.volume` | `"40"` | Set audio volume 0–150% (wpctl → pactl → amixer) |
+| `gtt.settings.nightlight` | `"true"` or `"false"` | Toggle GNOME Night Light via gsettings |
+| `gtt.settings.dconf` | `"/path/key value"` | `dconf write` |
+| `gtt.settings.gsettings` | `"schema key value"` | `gsettings set` |
+| `gtt.system.kill` | `"1234"` | `kill -9 <pid>` |
+| `gtt.system.killname` | `"chrome"` | `pkill -9 <name>` |
+| `gtt.system.service` | `"restart:nginx"` | `systemctl <action> <service>` (allow-listed actions only) |
+| `gtt.system.notify` | `"Title\|Body"` | `notify-send` desktop notification |
+| `gtt.system.exec` | `"bash cmd"` | Execute arbitrary shell command |
+
+```bash
+# Dim the screen to 30%:
+kc-bus pub gtt.settings.brightness 30
+
+# Set volume to 50% and wait for confirmation:
+kc-bus pub gtt.settings.volume 50
+kc-bus wait gtt.system.ack.settings_volume --data-only
+
+# Restart a systemd service:
+kc-bus pub gtt.system.service "restart:nginx"
+
+# Send a desktop notification:
+kc-bus pub gtt.system.notify "Alert|CPU is above 90%"
+
+# Write a dconf key:
+kc-bus pub gtt.settings.dconf "/org/gnome/desktop/interface/color-scheme 'prefer-dark'"
+```
+
+---
+
 ## Message envelope
 
 Every message stored in the ring buffer carries:
