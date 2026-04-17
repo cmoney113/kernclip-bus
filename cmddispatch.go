@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -193,9 +195,20 @@ func handleNotify(data string) (string, error) {
 }
 
 func handleExec(data string) (string, error) {
-	// Runs an arbitrary shell command. Use sparingly.
-	out, err := exec.Command("bash", "-c", data).CombinedOutput()
-	return string(out), err
+	cmd := exec.Command("bash", "-c", data)
+	cmd.Stdin = nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid:   true,             // Prevent signal propagation
+		Pdeathsig: syscall.SIGTERM,  // Die if parent dies
+	}
+	// Prevent fd leakage to children
+	cmd.Env = append(os.Environ(), "KERNCLIP_BUS_FD=CLOSED")
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("exec failed: %w (output: %s)", err, string(out))
+	}
+	return string(out), nil
 }
 
 // ── Dispatcher loop ───────────────────────────────────────────────────────────
@@ -253,7 +266,15 @@ func startCommandDispatcher(bus *Bus) {
 				case "gtt.system.notify":
 					out, err = handleNotify(m.Data)
 				case "gtt.system.exec":
-					out, err = handleExec(m.Data)
+					select {
+					case bus.execSem <- struct{}{}:
+						defer func() { <-bus.execSem }()
+						out, err = handleExec(m.Data)
+					default:
+						log.Printf("[cmddispatch] exec rejected: too many concurrent commands")
+						publishACK(bus, m.Topic, false, "rate limited: system busy")
+						return
+					}
 				default:
 					log.Printf("[cmddispatch] unhandled topic: %s", m.Topic)
 					return

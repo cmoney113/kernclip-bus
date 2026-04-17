@@ -156,18 +156,22 @@ func (t *topic) info() map[string]interface{} {
 	}
 }
 type Bus struct {
-	mu       sync.RWMutex
-	topics   map[string]*topic
-	config   Config
-	patterns *PatternRegistry
+	mu        sync.RWMutex
+	topics    map[string]*topic
+	config    Config
+	patterns  *PatternRegistry
+	StartTime time.Time
+	execSem   chan struct{} // Limit concurrent execs
 }
 
 func newBus() *Bus {
 	cfg := DefaultConfig
 	b := &Bus{
-		topics:   make(map[string]*topic),
-		config:   cfg,
-		patterns: NewPatternRegistry(),
+		topics:    make(map[string]*topic),
+		config:    cfg,
+		patterns:  NewPatternRegistry(),
+		StartTime: time.Now(),
+		execSem:   make(chan struct{}, 10), // Max 10 concurrent execs
 	}
 	// built-in clipboard topic
 	b.getOrCreate("kernclip.clipboard")
@@ -176,9 +180,11 @@ func newBus() *Bus {
 
 func newBusWithConfig(cfg Config) *Bus {
 	b := &Bus{
-		topics:   make(map[string]*topic),
-		config:   cfg,
-		patterns: NewPatternRegistry(),
+		topics:    make(map[string]*topic),
+		config:    cfg,
+		patterns:  NewPatternRegistry(),
+		StartTime: time.Now(),
+		execSem:   make(chan struct{}, 10), // Max 10 concurrent execs
 	}
 	// built-in clipboard topic
 	b.getOrCreate("kernclip.clipboard")
@@ -303,7 +309,7 @@ func sender(c net.Conn) string {
 // the MCP server exposes it automatically with no other changes needed.
 func buildManifest(bus *Bus) *Manifest {
 	return &Manifest{
-		Version: "1.1.0",
+		Version: "1.1.1",
 		Socket:  socketPath(),
 		Ops: []OpDef{
 			{
@@ -786,12 +792,14 @@ func handleConn(conn net.Conn, bus *Bus) {
 		case "status":
 			names := bus.topicNames()
 			enc.Encode(map[string]interface{}{
-				"ok":           true,
-				"running":      true,
-				"topic_count":  len(names),
-				"topics":       names,
-				"socket":       socketPath(),
-				"version":      "1.1.0",
+				"ok":              true,
+				"running":         true,
+				"uptime":          time.Since(bus.StartTime).Round(time.Second).String(),
+				"heartbeat_topic": "gtt.system.heartbeat",
+				"topic_count":     len(names),
+				"topics":          names,
+				"socket":          socketPath(),
+				"version":         "1.1.1", // Bumped for watchdog inclusion
 			})
 
 		// ── System monitor read ops ───────────────────────────────────────────
@@ -999,12 +1007,45 @@ func handleSubMulti(conn net.Conn, enc *json.Encoder, bus *Bus, topics []string)
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+// startWatchdog publishes a programmatic heartbeat every 5s to verify bus health.
+func startWatchdog(bus *Bus) {
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		startTime := time.Now()
+
+		for range ticker.C {
+			// Recover from panics in watchdog itself
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[watchdog] recovered from panic: %v", r)
+					}
+				}()
+
+				topic := bus.getOrCreate("gtt.system.heartbeat")
+				uptime := time.Since(startTime).Round(time.Second).String()
+				data := fmt.Sprintf(`{"status":"ok","uptime":%q,"topic_count":%d}`, uptime, len(bus.topicNames()))
+				msg := Message{
+					Topic:  "gtt.system.heartbeat",
+					Mime:   "application/json",
+					Data:   data,
+					Sender: "kernclip-busd/watchdog",
+				}
+				published := topic.publish(msg)
+				bus.patterns.FanOut("gtt.system.heartbeat", published)
+			}()
+		}
+	}()
+}
+
 func socketPath() string {
 	uid := os.Getuid()
 	return fmt.Sprintf("/run/user/%d/kernclip-bus.sock", uid)
 }
 
 func main() {
+	InitSafeguards()
 	sockPath := socketPath()
 	os.Remove(sockPath)
 
@@ -1029,6 +1070,9 @@ func main() {
 	// command topics and executes side effects (brightness, volume, dconf,
 	// systemctl, kill, notify-send, etc.).
 	startCommandDispatcher(bus)
+
+	// Internal Watchdog: publishes a pulse every 5s to gtt.system.heartbeat
+	startWatchdog(bus)
 
 	log.Printf("kernclip-busd listening on %s", sockPath)
 

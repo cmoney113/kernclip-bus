@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -269,6 +270,8 @@ func parseProcName(pid int) string {
 	return strings.TrimSpace(string(data))
 }
 
+const maxProcsToAnalyze = 50
+
 func getTopDiskWriters(prevIO map[int]uint64, elapsed float64) ([]DiskWriter, map[int]uint64) {
 	entries, _ := os.ReadDir("/proc")
 	currIO := make(map[int]uint64)
@@ -279,7 +282,11 @@ func getTopDiskWriters(prevIO map[int]uint64, elapsed float64) ([]DiskWriter, ma
 	}
 	var writers []pidWrite
 
+	analyzed := 0
 	for _, e := range entries {
+		if analyzed >= maxProcsToAnalyze {
+			break
+		}
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil {
 			continue
@@ -288,6 +295,7 @@ func getTopDiskWriters(prevIO map[int]uint64, elapsed float64) ([]DiskWriter, ma
 		if err != nil {
 			continue
 		}
+		analyzed++
 		currIO[pid] = writeBytes
 		if prev, ok := prevIO[pid]; ok && elapsed > 0 {
 			speed := float64(writeBytes-prev) / elapsed
@@ -301,12 +309,10 @@ func getTopDiskWriters(prevIO map[int]uint64, elapsed float64) ([]DiskWriter, ma
 		}
 	}
 
-	// sort descending by speed (simple insertion sort for small N)
-	for i := 1; i < len(writers); i++ {
-		for j := i; j > 0 && writers[j].speed > writers[j-1].speed; j-- {
-			writers[j], writers[j-1] = writers[j-1], writers[j]
-		}
-	}
+	// Use sort.Slice instead of insertion sort — O(n log n) vs O(n²)
+	sort.Slice(writers, func(i, j int) bool {
+		return writers[i].speed > writers[j].speed
+	})
 
 	top := 5
 	if len(writers) < top {
@@ -341,95 +347,127 @@ func startSystemMonitor(bus *Bus, interval time.Duration) {
 
 		time.Sleep(interval)
 
+		// Circuit breaker
+		consecutiveErrors := 0
+		maxErrors := 3
+
 		for {
+			if consecutiveErrors >= maxErrors {
+				log.Printf("[sysmon] circuit breaker open: too many errors, backing off 30s")
+				time.Sleep(30 * time.Second)
+				consecutiveErrors = 0
+				continue
+			}
+
 			now := time.Now()
 			elapsed := now.Sub(prevTime).Seconds()
 			prevTime = now
 
-			// CPU
-			currCPU, err := parseCPUStat()
-			var cpuPct float64
-			var perCore []float64
-			if err == nil {
-				cpuPct, perCore = calcCPUPercent(prevCPU, currCPU)
-				prevCPU = currCPU
-			}
-
-			// Memory
-			ramUsed, ramTotal, swapUsed, swapTotal, _ := parseMemInfo()
-			ramPct := 0.0
-			swapPct := 0.0
-			if ramTotal > 0 {
-				ramPct = 100.0 * float64(ramUsed) / float64(ramTotal)
-			}
-			if swapTotal > 0 {
-				swapPct = 100.0 * float64(swapUsed) / float64(swapTotal)
-			}
-
-			// Disk
-			currDisk, _ := parseDiskStats()
-			diskRead, diskWrite := calcDiskSpeed(prevDisk, currDisk, elapsed)
-			prevDisk = currDisk
-
-			// Network
-			currNet, _ := parseNetDev()
-			netDL, netUL := calcNetSpeed(prevNet, currNet, elapsed)
-			prevNet = currNet
-
-			// Process count
-			procCount := countProcesses()
-
-			// Disk writers
-			topWriters, currIO := getTopDiskWriters(prevIO, elapsed)
-			prevIO = currIO
-
-			// Publish metrics
-			metrics := SystemMetrics{
-				Type:             "system_metrics",
-				Timestamp:        float64(now.UnixMilli()) / 1000.0,
-				CPUPercent:       cpuPct,
-				PerCoreCPU:       perCore,
-				RAMUsedPercent:   ramPct,
-				RAMUsed:          ramUsed,
-				RAMTotal:         ramTotal,
-				SwapUsedPercent:  swapPct,
-				DiskReadSpeed:    diskRead,
-				DiskWriteSpeed:   diskWrite,
-				NetDownloadSpeed: netDL,
-				NetUploadSpeed:   netUL,
-				ProcessCount:     procCount,
-			}
-
-			if data, err := json.Marshal(metrics); err == nil {
-				t := bus.getOrCreate("gtt.system.metrics")
-				msg := Message{
-					Topic:  "gtt.system.metrics",
-					Mime:   "application/json",
-					Data:   string(data),
-					Sender: "kernclip-busd/sysmon",
-				}
-				published := t.publish(msg)
-				bus.patterns.FanOut("gtt.system.metrics", published)
-			}
-
-			// Publish top disk writers
-			if len(topWriters) > 0 {
-				if data, err := json.Marshal(topWriters); err == nil {
-					t := bus.getOrCreate("gtt.system.top_disk_writers")
-					msg := Message{
-						Topic:  "gtt.system.top_disk_writers",
-						Mime:   "application/json",
-						Data:   string(data),
-						Sender: "kernclip-busd/sysmon",
-					}
-					published := t.publish(msg)
-					bus.patterns.FanOut("gtt.system.top_disk_writers", published)
-				}
+			err := runMonitorCycle(bus, elapsed, prevCPU, prevDisk, prevNet, prevIO, &prevCPU, &prevDisk, &prevNet, &prevIO)
+			if err != nil {
+				consecutiveErrors++
+				log.Printf("[sysmon] error: %v", err)
+			} else {
+				consecutiveErrors = 0
 			}
 
 			time.Sleep(interval)
 		}
 	}()
+}
+
+func runMonitorCycle(bus *Bus, elapsed float64,
+	prevCPU []cpuSample, prevDisk map[string]diskSample, prevNet map[string]netSample, prevIO map[int]uint64,
+	outCPU *[]cpuSample, outDisk *map[string]diskSample, outNet *map[string]netSample, outIO *map[int]uint64,
+) error {
+	now := time.Now()
+
+	// CPU
+	currCPU, err := parseCPUStat()
+	var cpuPct float64
+	var perCore []float64
+	if err != nil {
+		return fmt.Errorf("cpu parse: %w", err)
+	}
+	cpuPct, perCore = calcCPUPercent(prevCPU, currCPU)
+	*outCPU = currCPU
+
+	// Memory
+	ramUsed, ramTotal, swapUsed, swapTotal, err := parseMemInfo()
+	if err != nil {
+		return fmt.Errorf("meminfo parse: %w", err)
+	}
+	ramPct := 0.0
+	swapPct := 0.0
+	if ramTotal > 0 {
+		ramPct = 100.0 * float64(ramUsed) / float64(ramTotal)
+	}
+	if swapTotal > 0 {
+		swapPct = 100.0 * float64(swapUsed) / float64(swapTotal)
+	}
+
+	// Disk
+	currDisk, _ := parseDiskStats()
+	diskRead, diskWrite := calcDiskSpeed(prevDisk, currDisk, elapsed)
+	*outDisk = currDisk
+
+	// Network
+	currNet, _ := parseNetDev()
+	netDL, netUL := calcNetSpeed(prevNet, currNet, elapsed)
+	*outNet = currNet
+
+	// Process count
+	procCount := countProcesses()
+
+	// Disk writers
+	topWriters, currIO := getTopDiskWriters(prevIO, elapsed)
+	*outIO = currIO
+
+	// Publish metrics
+	metrics := SystemMetrics{
+		Type:             "system_metrics",
+		Timestamp:        float64(now.UnixMilli()) / 1000.0,
+		CPUPercent:       cpuPct,
+		PerCoreCPU:       perCore,
+		RAMUsedPercent:   ramPct,
+		RAMUsed:          ramUsed,
+		RAMTotal:         ramTotal,
+		SwapUsedPercent:  swapPct,
+		DiskReadSpeed:    diskRead,
+		DiskWriteSpeed:   diskWrite,
+		NetDownloadSpeed: netDL,
+		NetUploadSpeed:   netUL,
+		ProcessCount:     procCount,
+	}
+
+	if data, err := json.Marshal(metrics); err == nil {
+		t := bus.getOrCreate("gtt.system.metrics")
+		msg := Message{
+			Topic:  "gtt.system.metrics",
+			Mime:   "application/json",
+			Data:   string(data),
+			Sender: "kernclip-busd/sysmon",
+		}
+		published := t.publish(msg)
+		bus.patterns.FanOut("gtt.system.metrics", published)
+	}
+
+	// Publish top disk writers
+	if len(topWriters) > 0 {
+		if data, err := json.Marshal(topWriters); err == nil {
+			t := bus.getOrCreate("gtt.system.top_disk_writers")
+			msg := Message{
+				Topic:  "gtt.system.top_disk_writers",
+				Mime:   "application/json",
+				Data:   string(data),
+				Sender: "kernclip-busd/sysmon",
+			}
+			published := t.publish(msg)
+			bus.patterns.FanOut("gtt.system.top_disk_writers", published)
+		}
+	}
+
+	return nil
 }
 
 // sysmonConfigPath returns the default config path for sysmon overrides.
